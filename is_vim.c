@@ -93,11 +93,15 @@ void find_item_ends(
     // The first entry is pid1, which can't have a tty yet
     // It is indicated by ?, and so we have [STATUS] ?\n
     // so we subtract out 3 characters to obtain the status end offset
-    *status_end = position - 3;
+    position -= 3;
 
-    // Statuses are always 1 character, and so
-    // we can subtract 2 more characters to find the end of the name
-    *name_end = *status_end - 2;
+    *status_end = position;
+
+    // Go back until position is on a delimiter
+    for (;!is_delimiter(output[position]); position--);
+
+    // set name end to before the delimiter
+    *name_end = position - 1;
 }
 
 
