@@ -2,7 +2,7 @@
 This is a simple project I created to go along with vim-tmux-navigator
 
 ## Purpose
-vim-tmux-navigator checks if the current tmux pane is using a simple shell script, which usually works fine.
+vim-tmux-navigator checks if the current tmux pane is a vim instance using a simple shell script, which usually works fine.
 However, this script can't handle nested shells (such as pipenv shell), and so using tmux-vim-navigator will break certain workflows.
 This is a **known issue**, and although there are [some solutions](https://github.com/christoomey/vim-tmux-navigator/issues/195#issuecomment-384983711), I wasn't satisfied with them.
 In particular, I found that the [more complex shell script solution](https://gist.github.com/akselsjogren/35aec0af39e53319e12a3e1432da4d4e) took about 0.24s to run on my machine, which was very noticeable in my workflow.
