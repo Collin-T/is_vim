@@ -1,349 +1,306 @@
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define CHUNK_SIZE 1024
+// structs
 
-#define PARSEMODE_FIND_PID_END 0
-#define PARSEMODE_FIND_PARENT_PID_END 1
-#define PARSEMODE_FIND_NAME_END 2
-#define PARSEMODE_FIND_STATUS_END 3
-#define PARSEMODE_FIND_LINE_END 4
+// use stringref to avoid redundant allocations
+typedef struct __stringref {
+    const char* str;
+    size_t len;
+} stringref;
 
-#define PARSESTATUS_SEEKING_START 0
-#define PARSESTATUS_SEEKING_END 1
+// a process info struct to contain data
+typedef struct __process_info {
+    unsigned pid,
+             ppid;
+    stringref name,
+              state,
+              tty;
+} process_info;
 
-int is_line_separator(int x) {
-    return x == '\n' || x == '\0';
+
+// the size of each chunk that is digested
+// at the moment this is 4KB
+#define PROCESS_INFO_DIGEST_SIZE (1 << 12)
+
+#define ZONE_UNINITIALIZED 0
+#define ZONE_PID 1
+#define ZONE_PID_DELIMITER 2
+#define ZONE_PPID 3
+#define ZONE_PPID_DELIMITER 4
+#define ZONE_STATE 5
+#define ZONE_STATE_DELIMITER 6
+#define ZONE_TTY 7
+#define ZONE_TTY_DELIMITER 8
+#define ZONE_NAME 9
+
+
+char* raw_process_info = NULL;
+size_t raw_process_info_size = 0;
+
+process_info* processes = NULL;
+size_t process_count = 0,
+       process_capacity = 0;
+
+
+int is_line_separator(char c) {
+    return c == '\n' || c == '\0';
 }
 
-
-int is_delimiter(int x) {
-    return x == ' ' || x == '\t' || is_line_separator(x);
+int is_delimiter(char c) {
+    return c == ' ' || c == '\t' || is_line_separator(c);
 }
 
-
-int inactive_status(int code) {
-    return code == 'T' || code == 'X' || code == 'Z';
+int status_is_active(const stringref* status) {
+    int code = status->str[0];
+    return code != 'T' && code != 'X' && code != 'Z';
 }
 
-
-int parse_integer(const char* string, size_t start, size_t end) {
-    int output = 0;
-
-    string += start;
-    for (; start++ <= end; string++) {
+unsigned parse_pid(const stringref* ref) {
+    unsigned output = 0;
+    for (size_t i = 0; i < ref->len; i++) {
         output *= 10;
-        output += *string - '0';
+        output += ref->str[i] - '0';
     }
 
     return output;
 }
 
+void trim(stringref* ref) {
+    const char* start = ref->str,
+              * end = &ref->str[ref->len - 1];
 
-void trim_string(const char* string, size_t* begin, size_t* end) {
-    size_t _begin, _end;
+    while (is_delimiter(*start))
+        start++;
 
-    for (_begin = *begin; is_delimiter(string[_begin]); _begin++);
-    for (_end = *end; is_delimiter(string[_end]); _end--);
+    while (is_delimiter(*end))
+        end--;
 
-    *begin = _begin;
-    *end = _end;
+    ref->str = start;
+    ref->len = end - start + 1;
+}
+
+int stringref_equal(const stringref* str1, const stringref* str2) {
+    if (str1->len != str2->len)
+        return 0;
+
+    return memcmp(str1->str, str2->str, str1->len) == 0;
 }
 
 
-void find_item_ends(
-    const char* output,
+int get_ps_output() {
+    FILE* stream = popen("ps ax -o pid=,ppid=,state=,tty=,comm=", "r");
+    size_t digest_count;
+    if (!stream)
+        return EXIT_FAILURE;
+
+    do {
+        raw_process_info = realloc(raw_process_info, raw_process_info_size + PROCESS_INFO_DIGEST_SIZE);
+        if (!raw_process_info)
+            return ENOMEM;
+
+        digest_count = fread(&raw_process_info[raw_process_info_size], 1, PROCESS_INFO_DIGEST_SIZE, stream);
+        raw_process_info_size += digest_count;
+    } while (digest_count == PROCESS_INFO_DIGEST_SIZE);
+
+    return 0;
+}
+
+void get_item_offsets(
     size_t* pid_end,
-    size_t* parent_pid_end,
-    size_t* name_end,
-    size_t* status_end)
-{
-    size_t position;
-    int parse_mode = PARSEMODE_FIND_PID_END,
-        parse_status = PARSESTATUS_SEEKING_START;
+    size_t* ppid_end,
+    size_t* state_start,
+    size_t* tty_start,
+    size_t* name_start
+) {
+    size_t offset = 0;
 
-    // Each column is right aligned, except the tty, which is left aligned
-    // and columns go in order pid, parent pid, name, status, and tty
+    for (int zone = ZONE_UNINITIALIZED; zone != ZONE_NAME; offset++) {
+        int delimiter = is_delimiter(raw_process_info[offset]);
 
-    for (position = 0; !is_line_separator(output[position]); position++) {
-        // since the name may include column delimiters
-        // there is no way to determine where the name ends in this loop
-        //
-        // because of this we only find the end of the pids in this loop
+        if (!delimiter && !(zone & 1)) {
+            // even states are delimiters
+            // and so the state changes when a non-delimiter is reached
 
-        if (parse_mode == PARSEMODE_FIND_PID_END || parse_mode == PARSEMODE_FIND_PARENT_PID_END) {
+            if (zone == ZONE_PPID_DELIMITER)
+                *state_start = offset;
+            else if (zone == ZONE_STATE_DELIMITER)
+                *tty_start = offset;
+            else if (zone == ZONE_TTY_DELIMITER)
+                *name_start = offset;
+            zone++;
 
-            if (parse_status == PARSESTATUS_SEEKING_START && !is_delimiter(output[position]))
-                parse_status = PARSESTATUS_SEEKING_END;
-            else if (parse_status == PARSESTATUS_SEEKING_END && is_delimiter(output[position])) {
-                parse_status = PARSESTATUS_SEEKING_START;
+        } else if (delimiter && (zone & 1)) {
+            // odd states are not delimiters
+            // and so the state changes when a delimiter is reached
 
-                if (parse_mode == PARSEMODE_FIND_PID_END) {
-                    *pid_end = position - 1;
-                    parse_mode = PARSEMODE_FIND_PARENT_PID_END;
-                } else {
-                    *parent_pid_end = position - 1;
-                    parse_mode = PARSEMODE_FIND_LINE_END;
-                }
+            if (zone == ZONE_PID)
+                *pid_end = offset;
+            else if (zone == ZONE_PPID)
+                *ppid_end = offset;
+            zone++;
+        }
+    }
+}
+
+int parse_process_output() {
+    stringref item;
+
+    size_t pid_end,
+           ppid_end,
+           state_start,
+           tty_start,
+           name_start;
+
+    get_item_offsets(&pid_end, &ppid_end, &state_start, &tty_start, &name_start);
+
+    for (size_t offset = 0; offset < raw_process_info_size; process_count++) {
+
+        // resize if necessary
+        if (process_count + 1 >= process_capacity) {
+            process_capacity = (process_count + 1) * 2;
+
+            processes = realloc(processes, sizeof(process_info) * process_capacity);
+            if (!processes)
+                return ENOMEM;
+        }
+
+        // parse pid
+        item.str = &raw_process_info[offset];
+        item.len = pid_end;
+        trim(&item);
+        processes[process_count].pid = parse_pid(&item);
+
+        // parse ppid
+        item.str = &raw_process_info[offset + pid_end];
+        item.len = ppid_end - pid_end;
+        trim(&item);
+        processes[process_count].ppid = parse_pid(&item);
+
+        // parse state
+        item.str = &raw_process_info[offset + state_start];
+        item.len = tty_start - state_start;
+        trim(&item);
+        memcpy(&processes[process_count].state, &item, sizeof(item));
+
+        // parse tty
+        item.str = &raw_process_info[offset + tty_start];
+        item.len = name_start - tty_start;
+        trim(&item);
+        memcpy(&processes[process_count].tty, &item, sizeof(item));
+
+        // parse name
+        // since name goes to the end of the line, we must find the length manually
+        offset += name_start;
+        item.str = &raw_process_info[offset];
+
+        item.len = 0;
+        while (!is_line_separator(raw_process_info[offset++]))
+            item.len++;
+
+        trim(&item);
+        memcpy(&processes[process_count].name, &item, sizeof(item));
+    }
+
+    return 0;
+}
+
+int find_vim(const char* tty) {
+    size_t* procs  = malloc(sizeof(size_t) * process_count),
+          * pprocs = malloc(sizeof(size_t) * process_count);
+    size_t proc_count  = 0,
+           pproc_count = 0;
+
+    // wrap strings in stringrefs for faster/easier comparing
+    stringref tty_ref, vim_ref, nvim_ref;
+
+    tty_ref.str = tty;
+    tty_ref.len = strlen(tty);
+
+    vim_ref.str = "vim";
+    vim_ref.len = strlen(vim_ref.str);
+
+    nvim_ref.str = "nvim";
+    nvim_ref.len = strlen(nvim_ref.str);
+    
+    // find initial pids (which must belong to the current tty)
+    for (size_t i = 0; i < process_count; i++) {
+        if (stringref_equal(&tty_ref, &processes[i].tty)) {
+            procs[proc_count++] = i;
+        }
+    }
+
+    while (proc_count > 0) {
+        for (size_t i = 0; i < proc_count; i++) {
+            if ((stringref_equal(&processes[procs[i]].name, &vim_ref)  ||
+                stringref_equal(&processes[procs[i]].name, &nvim_ref)) &&
+                status_is_active(&processes[procs[i]].state)) {
+
+                free(procs);
+                free(pprocs);
+                return 0;
             }
         }
+
+        // find child processes
+        // pprocs and procs are swapped to avoid redundant mallocs
+        size_t* tmp = procs;
+        procs = pprocs;
+        pprocs = tmp;
+
+        pproc_count = proc_count;
+        proc_count = 0;
+
+        for (size_t i = 0; i < pproc_count; i++)
+            for (size_t j = 0; j < process_count; j++)
+                if (pprocs[i] == processes[j].ppid)
+                    procs[proc_count++] = processes[j].pid;
     }
 
-    // The first entry is pid1, which can't have a tty yet
-    // It is indicated by ?, and so we have [STATUS] ?\n
-    // so we subtract out 3 characters to obtain the status end offset
-    position -= 3;
-
-    *status_end = position;
-
-    // Go back until position is on a delimiter
-    for (;!is_delimiter(output[position]); position--);
-
-    // set name end to before the delimiter
-    *name_end = position - 1;
+    free(procs);
+    free(pprocs);
+    return EXIT_FAILURE;
 }
 
-
-void parse_output(
-    const char* output,
-    size_t* lines,
-    int** pids,
-    int** parent_pids,
-    const char*** names,
-    size_t** name_lengths,
-    char** statuses,
-    const char*** ttys,
-    size_t** tty_lengths)
-{
-    size_t pid_begin_offset, pid_end_offset,
-           parent_pid_begin_offset, parent_pid_end_offset,
-           name_begin_offset, name_end_offset,
-           status_begin_offset, status_end_offset,
-           tty_begin_offset,
-           line_count, item_count,
-           current_position;
-    const char** _names = NULL,
-              ** _ttys = NULL;
-    char* _statuses = NULL;
-    int* _pids = NULL,
-       * _parent_pids = NULL;
-    size_t* _name_lengths = NULL,
-          * _tty_lengths = NULL;
-
-    find_item_ends(output, &pid_end_offset, &parent_pid_end_offset, &name_end_offset, &status_end_offset);
-
-    pid_begin_offset = 0;
-    parent_pid_begin_offset = pid_end_offset + 2;
-    name_begin_offset = parent_pid_end_offset + 2;
-    status_begin_offset = name_end_offset + 2;
-    tty_begin_offset = status_end_offset + 2;
-
-    for (current_position = 0, line_count = 0, item_count = 0; output[current_position]; line_count++) {
-        if (line_count >= item_count) {
-            item_count += CHUNK_SIZE;
-
-            _pids = realloc(_pids, item_count * sizeof(*_pids));
-            _parent_pids = realloc(_parent_pids, item_count * sizeof(*_parent_pids));
-            _names = realloc(_names, item_count * sizeof(*_names));
-            _statuses = realloc(_statuses, item_count * sizeof(*_statuses));
-            _ttys = realloc(_ttys, item_count * sizeof(*_ttys));
-            _name_lengths = realloc(_name_lengths, item_count * sizeof(*_name_lengths));
-            _tty_lengths = realloc(_tty_lengths, item_count * sizeof(*_tty_lengths));
-        }
-
-        size_t start, end;
-
-        start = current_position + pid_begin_offset;
-        end = current_position + pid_end_offset;
-        trim_string(output, &start, &end);
-        _pids[line_count] = parse_integer(output, start, end);
-
-        start = current_position + parent_pid_begin_offset;
-        end = current_position + parent_pid_end_offset;
-        trim_string(output, &start, &end);
-        _parent_pids[line_count] = parse_integer(output, start, end);
-
-        start = current_position + name_begin_offset;
-        end = current_position + name_end_offset;
-        trim_string(output, &start, &end);
-        _names[line_count] = &output[start];
-        _name_lengths[line_count] = end - start + 1;
-
-        start = current_position + status_begin_offset;
-        _statuses[line_count] = output[start];
-
-        start = current_position + tty_begin_offset;
-        end = strchr(&output[start], '\n') - output;
-        _ttys[line_count] = &output[start];
-        _tty_lengths[line_count] = end - start;
-
-        current_position = end + 1;
+void cleanup() {
+    if (processes != NULL) {
+        free(processes);
+        processes = NULL;
     }
-
-    *lines = line_count;
-    *pids = _pids;
-    *parent_pids = _parent_pids;
-    *names = _names;
-    *name_lengths = _name_lengths;
-    *statuses = _statuses;
-    *ttys = _ttys;
-    *tty_lengths = _tty_lengths;
+    if (raw_process_info != NULL) {
+        free(raw_process_info);
+        raw_process_info = NULL;
+    }
 }
-
-
-struct cleanup_information {
-    FILE* handle;
-    char* buffer,
-        * statuses;
-    int* pids,
-       * parent_pids;
-    size_t * current_proc_indices,
-           * next_proc_indices,
-           * name_lengths,
-           * tty_lengths;
-} cleanup_info;
-
-
-void cleanup_resources() {
-    // basic cleanup function
-    // non-null handles have been initialized and should be cleaned up
-
-    if (cleanup_info.handle)
-        pclose(cleanup_info.handle);
-    if (cleanup_info.buffer)
-        free(cleanup_info.buffer);
-    if (cleanup_info.statuses)
-        free(cleanup_info.statuses);
-    if (cleanup_info.pids)
-        free(cleanup_info.pids);
-    if (cleanup_info.parent_pids)
-        free(cleanup_info.parent_pids);
-    if (cleanup_info.current_proc_indices)
-        free(cleanup_info.current_proc_indices);
-    if (cleanup_info.next_proc_indices)
-        free(cleanup_info.next_proc_indices);
-    if (cleanup_info.name_lengths)
-        free(cleanup_info.name_lengths);
-    if (cleanup_info.tty_lengths)
-        free(cleanup_info.tty_lengths);
-}
-
 
 int main(int argc, char ** argv) {
-    FILE* handle = NULL;
-    char* buffer = NULL;
-    size_t buffer_size, read_size;
-    int* pids = NULL,
-       * parent_pids = NULL,
-       exit_code;
-    char* statuses = NULL;
-    const char** names = NULL,
-              ** ttys = NULL;
-
-    size_t lines,
-           current_proc_count,
-           next_proc_count,
-           * current_proc_indices = NULL,
-           * next_proc_indices = NULL,
-           * name_lengths = NULL,
-           * tty_lengths = NULL;
-
-    memset(&cleanup_info, 0, sizeof(cleanup_info));
-    atexit(cleanup_resources);
-
     if (argc != 2) {
         fputs("No tty given!\n", stderr);
         return 1;
-    } else if (argv[1][0] == '/') {
-        // oftentimes the device of the tty will be passed instead of its name as given by ps
-        // so we adjust the pointer of the tty name if needed
-
-        const char* dev = "/dev/";
-
-        if (strncmp(argv[1], dev, strlen(dev)) == 0)
-            argv[1] += strlen(dev);
     }
 
-    // since obtaining a list of open processes is platform dependent
-    // we pipe the information from ps and parse the output
-    handle = popen("ps ax -o pid=,ppid=,comm=,state=,tname=", "r");
-    cleanup_info.handle = handle;
+    atexit(cleanup);
 
-    if (!handle) {
-        // failed to open ps
-        perror("Failed to open ps");
-        return 1;
+
+    if (get_ps_output() != 0) {
+        cleanup();
+        return EXIT_FAILURE;
     }
 
-    buffer_size = 0;
-    read_size = 0;
-
-    while (!feof(handle)) {
-        // realloc buffer for new data
-        buffer = realloc(buffer, buffer_size + CHUNK_SIZE);
-        cleanup_info.buffer = buffer;
-
-        read_size = fread(buffer + buffer_size, 1, CHUNK_SIZE, handle);
-
-        // adjust buffer size
-        buffer_size += read_size;
+    if (parse_process_output() != 0) {
+        cleanup();
+        return EXIT_FAILURE;
     }
 
-    // close handle and set it to NULL so cleanup doesn't try to close it
-    pclose(handle);
-    cleanup_info.handle = NULL;
+    int exit_code;
+    if (strncmp(argv[1], "/dev/", 5) == 0)
+        exit_code = find_vim(&argv[1][5]);
+    else
+        exit_code = find_vim(argv[1]);
 
-    parse_output(buffer, &lines, &pids, &parent_pids, &names, &name_lengths, &statuses, &ttys, &tty_lengths);
 
-    cleanup_info.pids = pids;
-    cleanup_info.parent_pids = parent_pids;
-    cleanup_info.name_lengths = name_lengths;
-    cleanup_info.statuses = statuses;
-    cleanup_info.tty_lengths = tty_lengths;
-
-    current_proc_indices = malloc(lines * sizeof(*current_proc_indices));
-    next_proc_indices = malloc(lines * sizeof(*next_proc_indices));
-
-    cleanup_info.current_proc_indices = current_proc_indices;
-    cleanup_info.next_proc_indices = next_proc_indices;
-
-    // populate process list with processes that have the given tty
-    current_proc_count = 0;
-    for (size_t i = 0; i < lines; i++)
-        if (strncmp(ttys[i], argv[1], tty_lengths[i]) == 0)
-            current_proc_indices[current_proc_count++] = i;
-
-    for (;;) {
-        for (size_t i = 0; i < current_proc_count; i++) {
-            size_t index = current_proc_indices[i];
-            if ((strncmp(names[index], "nvim", name_lengths[index]) == 0 ||
-                strncmp(names[index], "vim", name_lengths[index]) == 0) &&
-                !inactive_status(statuses[index]))
-                return 0;
-        }
-
-        // obtain child processes of current process generation
-        next_proc_count = 0;
-        for (size_t i = 0; i < current_proc_count; i++) {
-            for (size_t j = 0; j < lines; j++) {
-                size_t index = current_proc_indices[i];
-                if (pids[index] == parent_pids[j]) {
-                    next_proc_indices[next_proc_count++] = j;
-                }
-            }
-        }
-
-        // if there are no child processes we failed to find vim
-        if (next_proc_count == 0)
-            return 1;
-
-        // update current processes with the next processes
-        // and swap the buffers to avoid extra calls to malloc and free
-        size_t* tmp_indices = current_proc_indices;
-        current_proc_indices = next_proc_indices;
-        next_proc_indices = tmp_indices;
-
-        current_proc_count = next_proc_count;
-    }
+    cleanup();
+    return exit_code;
 }
