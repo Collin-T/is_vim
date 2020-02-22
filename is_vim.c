@@ -255,8 +255,8 @@ int find_vim(const char* tty) {
 
         for (size_t i = 0; i < pproc_count; i++)
             for (size_t j = 0; j < process_count; j++)
-                if (pprocs[i] == processes[j].ppid)
-                    procs[proc_count++] = processes[j].pid;
+                if (processes[pprocs[i]].pid == processes[j].ppid)
+                    procs[proc_count++] = j;
     }
 
     free(procs);
