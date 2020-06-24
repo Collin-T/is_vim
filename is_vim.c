@@ -105,6 +105,8 @@ int get_ps_output() {
         raw_process_info_size += digest_count;
     } while (digest_count == PROCESS_INFO_DIGEST_SIZE);
 
+    fclose(stream);
+
     return 0;
 }
 
